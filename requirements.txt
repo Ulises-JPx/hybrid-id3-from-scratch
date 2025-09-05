@@ -1,0 +1,6 @@
+# --- Required dependencies ---
+# Plotting and saving PNG files (confusion matrix, tree)
+matplotlib>=3.8
+
+# Numerical arrays for plotting utilities (utils/plots.py)
+numpy>=1.26

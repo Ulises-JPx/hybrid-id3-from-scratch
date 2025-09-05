@@ -1,0 +1,7 @@
+Class	Precision	Recall	F1	Support
+No	1.000	1.000	1.000	5
+Yes	1.000	1.000	1.000	9
+
+Accuracy	1.0000
+Macro avg	1.000	1.000	1.000
+Weighted avg	1.000	1.000	1.000
