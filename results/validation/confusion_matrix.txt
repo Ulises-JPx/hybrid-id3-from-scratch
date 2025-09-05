@@ -1,3 +1,0 @@
-True\Pred	No	Yes
-No	2	0
-Yes	1	2
