@@ -8,7 +8,6 @@ It performs two main tasks:
 
 The script ensures that result directories are properly set up and previous results are cleared before each run.
 It loads the dataset, executes both showcase and validation workflows, and prints the results to the console.
-Visualization parameters for rendering decision trees are configurable.
 """
 
 from utils.files import reset_result_directories, ensure_result_directories, load_csv_data
@@ -44,18 +43,18 @@ def main():
         4. Runs the validation workflow (training/testing split).
         5. Prints accuracy results for both workflows.
     """
-    # Step 1: Clear previous results and ensure result directories exist
+    # Clear previous results and ensure result directories exist
     reset_result_directories(RESULTS_DIRECTORY)
     ensure_result_directories(RESULTS_DIRECTORY)
 
-    # Step 2: Load the dataset from CSV file
+    # Load the dataset from CSV file
     # Returns:
     #   feature_names: List of feature names (column headers)
     #   X: Feature matrix (list of lists or numpy array)
     #   y: Target labels (list or numpy array)
     feature_names, X, y = load_csv_data(DATASET_PATH)
 
-    # Step 3: Run showcase workflow (train and test on the entire dataset)
+    # Run showcase workflow (train and test on the entire dataset)
     showcase_results_dir = f"{RESULTS_DIRECTORY}/showcase"
     # Train and evaluate the model using all data for both training and testing
     # Returns training accuracy as a float
@@ -67,7 +66,7 @@ def main():
     print("** Training and testing on the entire dataset **\n")
     print(f"Training accuracy = {training_accuracy:.4f} (results saved in {showcase_results_dir})\n")
 
-    # Step 4: Run validation workflow (train/test split)
+    # Run validation workflow (train/test split)
     validation_results_dir = f"{RESULTS_DIRECTORY}/validation"
     # Train the model on a subset of the data and evaluate on the remaining data
     # Returns test accuracy as a float
