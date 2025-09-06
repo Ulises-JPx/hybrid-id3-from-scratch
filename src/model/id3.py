@@ -1,391 +1,747 @@
 """
 @author Ulises Jaramillo Portilla | A01798380 | Ulises-JPx
 
-- This file implements an improved ID3 decision tree algorithm from scratch in Python, without using any machine learning frameworks.
-- The DecisionTreeID3 class supports both categorical and numerical features, automatically determining the optimal threshold for numerical splits.
-- It includes robust handling for unseen feature values during prediction by falling back to the majority class at the current node.
-- The implementation provides safe stopping criteria such as maximum tree depth and minimum samples required to split, preventing overfitting and infinite recursion.
-- Additionally, the class offers a method to print the tree structure in a readable format.
+This file implements the DecisionTreeID3Plus class, an advanced decision tree classifier based on the ID3 algorithm.
+It supports both categorical and numeric features, and allows for selection of splitting criteria ("info_gain" or "gain_ratio").
+The implementation includes configurable parameters such as minimum information gain, maximum tree depth, and minimum samples required to split a node.
+It robustly handles missing and unseen feature values by falling back to the majority class at each node.
+The classifier provides probability predictions using Laplace smoothing and supports reduced-error pruning using a validation set.
+The code is fully documented and organized for clarity and maintainability.
 """
 
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Tuple, Optional
 
-class DecisionTreeID3:
+class _Node:
     """
-    Implements an improved ID3 decision tree algorithm supporting both categorical and numerical features.
-    Provides robust prediction and safe stopping criteria.
+    Internal class representing a node in the decision tree.
+
+    Attributes:
+        is_leaf (bool): Indicates if the node is a leaf.
+        prediction (Optional[str]): Predicted class label if leaf.
+        feature (Optional[str]): Feature name used for splitting.
+        threshold (Optional[float]): Threshold for numeric splits.
+        is_numeric (bool): True if the split is numeric.
+        children (Dict[Any, Any]): Child nodes for each split branch.
+        majority_class (Optional[str]): Majority class at this node.
+        class_counts (Dict[str, int]): Class label counts at this node.
+        depth (int): Depth of the node in the tree.
+    """
+    __slots__ = (
+        "is_leaf", "prediction", "feature", "threshold", "is_numeric",
+        "children", "majority_class", "class_counts", "depth"
+    )
+
+    def __init__(
+        self,
+        is_leaf: bool = False,
+        prediction: Optional[str] = None,
+        feature: Optional[str] = None,
+        threshold: Optional[float] = None,
+        is_numeric: bool = False,
+        children: Optional[Dict[Any, Any]] = None,
+        majority_class: Optional[str] = None,
+        class_counts: Optional[Dict[str, int]] = None,
+        depth: int = 0
+    ):
+        self.is_leaf = is_leaf
+        self.prediction = prediction
+        self.feature = feature
+        self.threshold = threshold
+        self.is_numeric = is_numeric
+        self.children = children or {}
+        self.majority_class = majority_class
+        self.class_counts = class_counts or {}
+        self.depth = depth
+
+class DecisionTreeID3Plus:
+    """
+    DecisionTreeID3Plus implements an ID3-based decision tree classifier with support for
+    categorical and numeric features, configurable splitting criteria, robust handling of missing values,
+    probability prediction with Laplace smoothing, and reduced-error pruning.
+
+    Parameters:
+        max_depth (Optional[int]): Maximum depth of the tree. None for unlimited.
+        min_samples_split (int): Minimum samples required to split a node.
+        min_gain (float): Minimum information gain required to split.
+        criterion (str): Splitting criterion ("info_gain" or "gain_ratio").
+        random_state (Optional[int]): Seed for random operations.
     """
 
-    def __init__(self, max_depth: Optional[int] = None, min_samples_split: int = 2):
-        """
-        Initializes the DecisionTreeID3 instance.
+    def __init__(
+        self,
+        max_depth: Optional[int] = None,
+        min_samples_split: int = 2,
+        min_gain: float = 0.0,
+        criterion: str = "gain_ratio",
+        random_state: Optional[int] = None
+    ):
+        self.tree: Optional[_Node] = None
+        self.feature_index_map: Dict[str, int] = {}
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_gain = float(min_gain)
+        self.criterion = criterion
+        self.random_state = random_state
+        if random_state is not None:
+            import random
+            random.seed(random_state)
+        self.class_labels_: List[str] = []
 
-        Parameters:
-            max_depth (Optional[int]): Maximum depth of the tree. If None, no limit is applied.
-            min_samples_split (int): Minimum number of samples required to split a node.
+    @staticmethod
+    def _normalize_value(value: Any) -> Optional[str]:
         """
-        self.tree: Any = None  # Stores the trained decision tree structure
-        self.feature_index_map: Dict[str, int] = {}  # Maps feature names to their column indices
-        self.max_depth = max_depth  # Maximum allowed depth for the tree
-        self.min_samples_split = min_samples_split  # Minimum samples required to split a node
+        Converts a value to a normalized string, handling None and empty strings.
 
-    def entropy(self, labels: List[str]) -> float:
+        Args:
+            value (Any): Input value.
+
+        Returns:
+            Optional[str]: Normalized string or None if missing.
         """
-        Calculates the entropy of a list of class labels.
+        if value is None:
+            return None
+        string_value = str(value).strip()
+        return string_value if string_value != "" else None
 
-        Parameters:
+    @staticmethod
+    def _entropy(labels: List[str]) -> float:
+        """
+        Computes the entropy of a list of class labels.
+
+        Args:
             labels (List[str]): List of class labels.
 
         Returns:
             float: Entropy value.
         """
-        total_count = len(labels)
-        if total_count == 0:
-            return 0.0  # No samples, entropy is zero
-
+        num_labels = len(labels)
+        if num_labels == 0:
+            return 0.0
         label_counts = Counter(labels)
-        # Calculate entropy using the formula: -sum(p * log2(p))
-        return -sum((count / total_count) * math.log2(count / total_count)
-                    for count in label_counts.values() if count > 0)
+        return -sum((count / num_labels) * math.log2(count / num_labels) for count in label_counts.values())
 
-    def best_split_numeric(self, features: List[List[str]], labels: List[str], feature_index: int) -> Tuple[float, Optional[float]]:
+    @staticmethod
+    def _split_info(child_sizes: List[int], total_size: int) -> float:
         """
-        Finds the best threshold for splitting a numerical feature to maximize information gain.
+        Computes the split information for gain ratio calculation.
 
-        Parameters:
-            features (List[List[str]]): Feature matrix.
-            labels (List[str]): Corresponding class labels.
-            feature_index (int): Index of the numerical feature to split.
+        Args:
+            child_sizes (List[int]): Sizes of each child split.
+            total_size (int): Total number of samples.
 
         Returns:
-            Tuple[float, Optional[float]]: Best information gain and corresponding threshold.
+            float: Split information value.
         """
-        if len(features) < 2:
-            return -1.0, None  # Not enough samples to split
+        split_information = 0.0
+        for child_size in child_sizes:
+            if child_size == 0 or total_size == 0:
+                continue
+            proportion = child_size / total_size
+            split_information -= proportion * math.log2(proportion)
+        return split_information
 
-        # Attempt to sort feature-label pairs by the numerical feature value
-        try:
-            sorted_pairs = sorted(zip(features, labels), key=lambda pair: float(pair[0][feature_index]))
-        except ValueError:
-            # If any value cannot be converted to float, do not split as numeric
-            return -1.0, None
+    @staticmethod
+    def _detect_feature_types(features: List[List[Any]]) -> List[str]:
+        """
+        Determines the type of each feature column (numeric or categorical).
 
-        sorted_features, sorted_labels = zip(*sorted_pairs)
+        Args:
+            features (List[List[Any]]): Feature matrix.
+
+        Returns:
+            List[str]: List of feature types ("numeric" or "categorical").
+        """
+        feature_types: List[str] = []
+        for column in zip(*features):
+            is_numeric = True
+            for value in column:
+                normalized_value = DecisionTreeID3Plus._normalize_value(value)
+                if normalized_value is None:
+                    continue
+                try:
+                    float(normalized_value)
+                except ValueError:
+                    is_numeric = False
+                    break
+            feature_types.append("numeric" if is_numeric else "categorical")
+        return feature_types
+
+    def _best_split_numeric(
+        self,
+        features: List[List[Any]],
+        labels: List[str],
+        feature_index: int
+    ) -> Tuple[float, Optional[float], List[int], List[int]]:
+        """
+        Finds the best threshold to split a numeric feature.
+
+        Args:
+            features (List[List[Any]]): Feature matrix.
+            labels (List[str]): Class labels.
+            feature_index (int): Index of the feature to split.
+
+        Returns:
+            Tuple containing:
+                - best_gain (float): Best gain achieved.
+                - best_threshold (Optional[float]): Threshold value for split.
+                - best_left_indices (List[int]): Indices for left split.
+                - best_right_indices (List[int]): Indices for right split.
+        """
+        value_label_index_triples = []
+        for i, row in enumerate(features):
+            normalized_value = self._normalize_value(row[feature_index])
+            if normalized_value is None:
+                continue
+            try:
+                float_value = float(normalized_value)
+            except ValueError:
+                continue
+            value_label_index_triples.append((float_value, labels[i], i))
+
+        if len(value_label_index_triples) < 2:
+            return -1.0, None, [], []
+
+        value_label_index_triples.sort(key=lambda t: t[0])
+        total_entropy = self._entropy(labels)
         best_gain = -1.0
         best_threshold = None
-        total_entropy = self.entropy(labels)
+        best_left_indices, best_right_indices = [], []
 
-        # Evaluate thresholds only at points where the class label changes
-        for i in range(1, len(sorted_features)):
-            if sorted_labels[i] != sorted_labels[i - 1]:
-                try:
-                    threshold = (float(sorted_features[i][feature_index]) +
-                                 float(sorted_features[i - 1][feature_index])) / 2.0
-                except ValueError:
-                    continue  # Skip if conversion fails
+        # Iterate over possible thresholds where label changes
+        for j in range(1, len(value_label_index_triples)):
+            if value_label_index_triples[j][1] == value_label_index_triples[j - 1][1]:
+                continue
+            threshold = (value_label_index_triples[j][0] + value_label_index_triples[j - 1][0]) / 2.0
+            left_indices = [idx for _, _, idx in value_label_index_triples[:j]]
+            right_indices = [idx for _, _, idx in value_label_index_triples[j:]]
 
-                left_labels = [sorted_labels[j] for j in range(i)]
-                right_labels = [sorted_labels[j] for j in range(i, len(sorted_labels))]
+            if not left_indices or not right_indices:
+                continue
 
-                # Calculate weighted entropy for the split
-                weighted_entropy = ((len(left_labels) / len(labels)) * self.entropy(left_labels) +
-                                    (len(right_labels) / len(labels)) * self.entropy(right_labels))
-                gain = total_entropy - weighted_entropy
+            left_labels = [labels[i] for i in left_indices]
+            right_labels = [labels[i] for i in right_indices]
+            weighted_entropy = (
+                (len(left_indices) / len(labels)) * self._entropy(left_labels)
+                + (len(right_indices) / len(labels)) * self._entropy(right_labels)
+            )
+            gain = total_entropy - weighted_entropy
 
-                # Update best gain and threshold if current gain is higher
-                if gain > best_gain:
-                    best_gain = gain
-                    best_threshold = threshold
+            # If using gain ratio, adjust gain by split information
+            if self.criterion == "gain_ratio":
+                split_information = self._split_info([len(left_indices), len(right_indices)], len(labels))
+                if split_information > 0:
+                    gain = gain / split_information
 
-        return best_gain, best_threshold
+            if gain > best_gain:
+                best_gain = gain
+                best_threshold = threshold
+                best_left_indices, best_right_indices = left_indices, right_indices
 
-    def information_gain(self, features: List[List[str]], labels: List[str], feature_index: int, feature_type: str) -> Tuple[float, Optional[float]]:
+        return best_gain, best_threshold, best_left_indices, best_right_indices
+
+    def _best_split_categorical(
+        self,
+        features: List[List[Any]],
+        labels: List[str],
+        feature_index: int
+    ) -> Tuple[float, Dict[str, List[int]]]:
         """
-        Computes the information gain for splitting on a given feature.
+        Finds the best split for a categorical feature.
 
-        Parameters:
-            features (List[List[str]]): Feature matrix.
-            labels (List[str]): Corresponding class labels.
-            feature_index (int): Index of the feature to evaluate.
-            feature_type (str): Type of the feature ("numeric" or "categorical").
+        Args:
+            features (List[List[Any]]): Feature matrix.
+            labels (List[str]): Class labels.
+            feature_index (int): Index of the feature to split.
 
         Returns:
-            Tuple[float, Optional[float]]: Information gain and threshold (if numeric).
+            Tuple containing:
+                - gain (float): Information gain achieved.
+                - buckets (Dict[str, List[int]]): Mapping from feature value to sample indices.
         """
-        if feature_type == "numeric":
-            # For numeric features, find the best threshold
-            return self.best_split_numeric(features, labels, feature_index)
+        total_entropy = self._entropy(labels)
+        buckets: Dict[str, List[int]] = defaultdict(list)
 
-        # For categorical features, calculate information gain for splitting by each unique value
-        total_entropy = self.entropy(labels)
-        unique_values = set(row[feature_index] for row in features)
+        # Group indices by feature value, handling missing values
+        for i, row in enumerate(features):
+            normalized_value = self._normalize_value(row[feature_index])
+            key = normalized_value if normalized_value is not None else "__MISSING__"
+            buckets[key].append(i)
+
+        if len(buckets) <= 1:
+            return -1.0, {}
+
+        child_sizes = [len(indices) for indices in buckets.values()]
         weighted_entropy = 0.0
+        for indices in buckets.values():
+            partition_labels = [labels[i] for i in indices]
+            weighted_entropy += (len(indices) / len(labels)) * self._entropy(partition_labels)
 
-        for value in unique_values:
-            subset_labels = [labels[i] for i in range(len(features)) if features[i][feature_index] == value]
-            weighted_entropy += (len(subset_labels) / len(labels)) * self.entropy(subset_labels)
+        gain = total_entropy - weighted_entropy
+        if self.criterion == "gain_ratio":
+            split_information = self._split_info(child_sizes, len(labels))
+            if split_information <= 0:
+                return -1.0, {}
+            gain = gain / split_information
 
-        return total_entropy - weighted_entropy, None
+        return gain, buckets
 
-    def build_tree(self, features: List[List[str]], labels: List[str],
-                   feature_names: List[str], feature_types: List[str],
-                   depth: int = 0) -> Any:
+    def _build(
+        self,
+        features: List[List[Any]],
+        labels: List[str],
+        feature_names: List[str],
+        feature_types: List[str],
+        depth: int
+    ) -> _Node:
         """
         Recursively builds the decision tree.
 
-        Parameters:
-            features (List[List[str]]): Feature matrix.
-            labels (List[str]): Corresponding class labels.
-            feature_names (List[str]): Names of the features.
-            feature_types (List[str]): Types of the features ("numeric" or "categorical").
+        Args:
+            features (List[List[Any]]): Feature matrix.
+            labels (List[str]): Class labels.
+            feature_names (List[str]): Names of features.
+            feature_types (List[str]): Types of features ("numeric" or "categorical").
             depth (int): Current depth in the tree.
 
         Returns:
-            Any: Tree node (dict or class label).
+            _Node: Root node of the constructed subtree.
         """
-        # Stopping criteria: all labels are the same
+        # If all labels are the same, create a leaf node
         if len(set(labels)) == 1:
-            return labels[0]
+            class_label = labels[0]
+            return _Node(
+                is_leaf=True,
+                prediction=class_label,
+                majority_class=class_label,
+                class_counts=Counter(labels),
+                depth=depth
+            )
 
-        # Stopping criteria: no features left to split
-        if not feature_names:
-            return Counter(labels).most_common(1)[0][0]
+        # If no features left, or depth/size limits reached, create a leaf node with majority class
+        if (
+            not feature_names
+            or (self.max_depth is not None and depth >= self.max_depth)
+            or len(features) < self.min_samples_split
+        ):
+            majority_class = self._majority(labels)
+            return _Node(
+                is_leaf=True,
+                prediction=majority_class,
+                majority_class=majority_class,
+                class_counts=Counter(labels),
+                depth=depth
+            )
 
-        # Stopping criteria: maximum depth reached
-        if self.max_depth is not None and depth >= self.max_depth:
-            return Counter(labels).most_common(1)[0][0]
-
-        # Stopping criteria: not enough samples to split
-        if len(features) < self.min_samples_split:
-            return Counter(labels).most_common(1)[0][0]
-
-        # Select the best feature and threshold to split on
+        # Search for the best split among all features
         best_gain = -1.0
+        best_split_type = None
         best_feature_index = None
         best_threshold = None
+        best_buckets: Dict[str, List[int]] = {}
+        best_left_indices: List[int] = []
+        best_right_indices: List[int] = []
 
-        for i in range(len(feature_names)):
-            gain, threshold = self.information_gain(features, labels, i, feature_types[i])
-            if gain > best_gain:
-                best_gain = gain
-                best_feature_index = i
-                best_threshold = threshold
+        for j, feature_name in enumerate(feature_names):
+            if feature_types[j] == "numeric":
+                gain, threshold, left_indices, right_indices = self._best_split_numeric(features, labels, j)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_split_type = "numeric"
+                    best_feature_index = j
+                    best_threshold = threshold
+                    best_left_indices, best_right_indices = left_indices, right_indices
+            else:
+                gain, buckets = self._best_split_categorical(features, labels, j)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_split_type = "categorical"
+                    best_feature_index = j
+                    best_buckets = buckets
 
-        # If no information gain, return majority class
-        if best_gain <= 0 or best_feature_index is None:
-            return Counter(labels).most_common(1)[0][0]
-
-        selected_feature_name = feature_names[best_feature_index]
-        selected_feature_type = feature_types[best_feature_index]
-
-        # Handle numeric feature split
-        if selected_feature_type == "numeric":
-            if best_threshold is None:
-                return Counter(labels).most_common(1)[0][0]
-
-            # Partition samples into left (<= threshold) and right (> threshold)
-            left_indices = [i for i in range(len(features))
-                            if self._to_float_safe(features[i][best_feature_index]) is not None and
-                            float(features[i][best_feature_index]) <= best_threshold]
-            right_indices = [i for i in range(len(features))
-                             if self._to_float_safe(features[i][best_feature_index]) is not None and
-                             float(features[i][best_feature_index]) > best_threshold]
-
-            # Prevent splits that do not reduce the dataset
-            if len(left_indices) == 0 or len(right_indices) == 0:
-                return Counter(labels).most_common(1)[0][0]
-            if len(left_indices) == len(features) or len(right_indices) == len(features):
-                return Counter(labels).most_common(1)[0][0]
-
-            left_features = [features[i] for i in left_indices]
-            left_labels = [labels[i] for i in left_indices]
-            right_features = [features[i] for i in right_indices]
-            right_labels = [labels[i] for i in right_indices]
-
-            # Create a node for the numeric split
-            return {
-                f"{selected_feature_name} <= {best_threshold}": {
-                    "True": self.build_tree(left_features, left_labels, feature_names, feature_types, depth + 1),
-                    "False": self.build_tree(right_features, right_labels, feature_names, feature_types, depth + 1)
-                }
-            }
-
-        # Handle categorical feature split
-        unique_values = set(row[best_feature_index] for row in features)
-        node = {selected_feature_name: {}}
-
-        for value in unique_values:
-            # Create subsets for each unique value of the categorical feature
-            subset_features = [row[:best_feature_index] + row[best_feature_index + 1:]
-                               for row in features if row[best_feature_index] == value]
-            subset_labels = [labels[i] for i in range(len(features)) if features[i][best_feature_index] == value]
-
-            # Recursively build subtree for each value
-            node[selected_feature_name][value] = self.build_tree(
-                subset_features, subset_labels,
-                feature_names[:best_feature_index] + feature_names[best_feature_index + 1:],
-                feature_types[:best_feature_index] + feature_types[best_feature_index + 1:],
-                depth + 1
+        # If no sufficient gain, create a leaf node with majority class
+        if best_gain <= self.min_gain or best_split_type is None or best_feature_index is None:
+            majority_class = self._majority(labels)
+            return _Node(
+                is_leaf=True,
+                prediction=majority_class,
+                majority_class=majority_class,
+                class_counts=Counter(labels),
+                depth=depth
             )
-        return node
 
-    def train(self, features: List[List[str]], labels: List[str], feature_names: List[str]) -> None:
-        """
-        Trains the decision tree using the provided dataset.
+        class_counts = Counter(labels)
+        majority_class = self._majority_from_counts(class_counts)
 
-        Parameters:
-            features (List[List[str]]): Feature matrix.
-            labels (List[str]): Corresponding class labels.
-            feature_names (List[str]): Names of the features.
+        if best_split_type == "numeric":
+            # Numeric split: do not remove feature, allow repeated splits
+            left_features = [features[i] for i in best_left_indices]
+            left_labels = [labels[i] for i in best_left_indices]
+            right_features = [features[i] for i in best_right_indices]
+            right_labels = [labels[i] for i in best_right_indices]
+
+            # If split is degenerate, fallback to leaf node
+            if not left_features or not right_features:
+                return _Node(
+                    is_leaf=True,
+                    prediction=majority_class,
+                    majority_class=majority_class,
+                    class_counts=class_counts,
+                    depth=depth
+                )
+
+            node = _Node(
+                is_leaf=False,
+                feature=feature_names[best_feature_index],
+                threshold=float(best_threshold),
+                is_numeric=True,
+                children={},
+                majority_class=majority_class,
+                class_counts=class_counts,
+                depth=depth
+            )
+
+            # Recursively build left and right subtrees
+            node.children["LE"] = self._build(left_features, left_labels, feature_names, feature_types, depth + 1)
+            node.children["GT"] = self._build(right_features, right_labels, feature_names, feature_types, depth + 1)
+            return node
+
+        else:
+            # Categorical split: remove feature for child nodes (ID3 style)
+            child_feature_names = feature_names[:best_feature_index] + feature_names[best_feature_index + 1:]
+            child_feature_types = feature_types[:best_feature_index] + feature_types[best_feature_index + 1:]
+
+            node = _Node(
+                is_leaf=False,
+                feature=feature_names[best_feature_index],
+                threshold=None,
+                is_numeric=False,
+                children={},
+                majority_class=majority_class,
+                class_counts=class_counts,
+                depth=depth
+            )
+
+            # Recursively build subtree for each feature value
+            for value, indices in best_buckets.items():
+                sub_features = [
+                    row[:best_feature_index] + row[best_feature_index + 1:]
+                    for i, row in enumerate(features) if i in indices
+                ]
+                sub_labels = [labels[i] for i in indices]
+                node.children[value] = self._build(
+                    sub_features,
+                    sub_labels,
+                    child_feature_names,
+                    child_feature_types,
+                    depth + 1
+                )
+            return node
+
+    def train(
+        self,
+        features: List[List[Any]],
+        labels: List[str],
+        feature_names: List[str]
+    ) -> None:
         """
-        # Map feature names to their indices for prediction
+        Trains the decision tree on the provided dataset.
+
+        Args:
+            features (List[List[Any]]): Feature matrix.
+            labels (List[str]): Class labels.
+            feature_names (List[str]): Names of features.
+        """
+        # Normalize features and labels for consistency
+        features = [[self._normalize_value(value) for value in row] for row in features]
+        labels = [self._normalize_value(label) for label in labels]
         self.feature_index_map = {name: i for i, name in enumerate(feature_names)}
+        self.class_labels_ = sorted(set(labels))
+        feature_types = self._detect_feature_types(features)
+        self.tree = self._build(features, labels, feature_names, feature_types, depth=0)
 
-        # Detect feature types: numeric or categorical
-        feature_types = []
-        for column in zip(*features):
-            try:
-                _ = [float(value) for value in column]
-                feature_types.append("numeric")
-            except ValueError:
-                feature_types.append("categorical")
-
-        # Build the decision tree recursively
-        self.tree = self.build_tree(features, labels, feature_names, feature_types, depth=0)
-
-    def _collect_leaf_labels(self, subtree: Any) -> List[str]:
+    def predict_one(self, sample: List[Any]) -> str:
         """
-        Collects all leaf class labels under a given subtree.
+        Predicts the class label for a single sample.
 
-        Parameters:
-            subtree (Any): Subtree of the decision tree.
-
-        Returns:
-            List[str]: List of class labels found in the leaves.
-        """
-        if not isinstance(subtree, dict):
-            return [subtree]  # Leaf node, return its label
-
-        labels = []
-        for child in subtree.values():
-            labels.extend(self._collect_leaf_labels(child))
-        return labels
-
-    def _to_float_safe(self, value: str) -> Optional[float]:
-        """
-        Safely converts a string to float, returning None if conversion fails.
-
-        Parameters:
-            value (str): String to convert.
-
-        Returns:
-            Optional[float]: Converted float value or None if conversion fails.
-        """
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return None
-
-    def predict_one(self, sample: List[str], tree: Any) -> str:
-        """
-        Predicts the class label for a single sample using the trained tree.
-
-        Parameters:
-            sample (List[str]): Feature values for the sample.
-            tree (Any): Decision tree or subtree to use for prediction.
+        Args:
+            sample (List[Any]): Feature values for the sample.
 
         Returns:
             str: Predicted class label.
         """
-        if not isinstance(tree, dict):
-            return tree  # Leaf node, return its label
+        node = self.tree
+        while node and not node.is_leaf:
+            feature = node.feature
+            index = self.feature_index_map.get(feature, None)
+            if index is None:
+                return node.majority_class  # Fallback if feature is missing
 
-        node_key = next(iter(tree))  # Get the key for the current node
+            value = self._normalize_value(sample[index])
 
-        # Handle numeric split node
-        if " <=" in node_key:
-            feature_name, threshold_str = node_key.split(" <=")
-            feature_name = feature_name.strip()
-            threshold = float(threshold_str.strip())
-            feature_index = self.feature_index_map[feature_name]
-            value = self._to_float_safe(sample[feature_index])
+            if node.is_numeric:
+                # For numeric features, fallback to majority if value is missing or invalid
+                if value is None:
+                    return node.majority_class
+                try:
+                    float_value = float(value)
+                except ValueError:
+                    return node.majority_class
+                branch = "LE" if float_value <= node.threshold else "GT"
+                child = node.children.get(branch)
+                if child is None:
+                    return node.majority_class
+                node = child
+            else:
+                # For categorical features, fallback to majority if value is missing or unseen
+                key = value if value is not None else "__MISSING__"
+                child = node.children.get(key)
+                if child is None:
+                    return node.majority_class
+                node = child
 
-            if value is None:
-                # If value cannot be converted, fallback to majority class at this node
-                leaf_labels = self._collect_leaf_labels(tree[node_key])
-                return Counter(leaf_labels).most_common(1)[0][0]
+        return node.prediction if node else None
 
-            branch = "True" if value <= threshold else "False"
-            return self.predict_one(sample, tree[node_key][branch])
-
-        # Handle categorical split node
-        feature_name = node_key
-        feature_index = self.feature_index_map[feature_name]
-        value = sample[feature_index]
-
-        if value in tree[node_key]:
-            return self.predict_one(sample, tree[node_key][value])
-
-        # If value not seen during training, fallback to majority class at this node
-        leaf_labels = self._collect_leaf_labels(tree[node_key])
-        return Counter(leaf_labels).most_common(1)[0][0]
-
-    def predict_batch(self, features: List[List[str]]) -> List[str]:
+    def predict_batch(self, features: List[List[Any]]) -> List[str]:
         """
         Predicts class labels for a batch of samples.
 
-        Parameters:
-            features (List[List[str]]): Feature matrix for samples.
+        Args:
+            features (List[List[Any]]): Feature matrix.
 
         Returns:
             List[str]: List of predicted class labels.
         """
-        return [self.predict_one(sample, self.tree) for sample in features]
+        return [self.predict_one(row) for row in features]
 
-    def _tree_lines(self, node: Any, indent: str = "", is_last: bool = True) -> List[str]:
+    def predict_proba_one(self, sample: List[Any], alpha: float = 1.0) -> Dict[str, float]:
         """
-        Recursively generates lines representing the tree structure for printing.
+        Predicts class probabilities for a single sample using Laplace smoothing.
 
-        Parameters:
-            node (Any): Current tree node or leaf.
-            indent (str): Indentation string for current level.
-            is_last (bool): Whether this node is the last child.
+        Args:
+            sample (List[Any]): Feature values for the sample.
+            alpha (float): Laplace smoothing parameter.
 
         Returns:
-            List[str]: List of strings representing the tree structure.
+            Dict[str, float]: Dictionary mapping class labels to probabilities.
+        """
+        node = self.tree
+        while node and not node.is_leaf:
+            feature = node.feature
+            index = self.feature_index_map.get(feature, None)
+            if index is None:
+                break
+            value = self._normalize_value(sample[index])
+
+            if node.is_numeric:
+                if value is None:
+                    break
+                try:
+                    float_value = float(value)
+                except ValueError:
+                    break
+                branch = "LE" if float_value <= node.threshold else "GT"
+                next_node = node.children.get(branch)
+                if next_node is None:
+                    break
+                node = next_node
+            else:
+                key = value if value is not None else "__MISSING__"
+                next_node = node.children.get(key)
+                if next_node is None:
+                    break
+                node = next_node
+
+        # Compute probabilities using class counts and Laplace smoothing
+        counts = Counter(node.class_counts) if node and node.class_counts else Counter()
+        total_count = sum(counts.values())
+        num_classes = len(self.class_labels_) if self.class_labels_ else len(counts)
+        probabilities: Dict[str, float] = {}
+        denominator = total_count + alpha * num_classes if num_classes > 0 else 1.0
+        classes_iter = self.class_labels_ if self.class_labels_ else list(counts.keys())
+        for class_label in classes_iter:
+            probabilities[class_label] = (counts.get(class_label, 0) + alpha) / denominator
+        return probabilities
+
+    def predict_proba(self, features: List[List[Any]], alpha: float = 1.0) -> List[Dict[str, float]]:
+        """
+        Predicts class probabilities for a batch of samples.
+
+        Args:
+            features (List[List[Any]]): Feature matrix.
+            alpha (float): Laplace smoothing parameter.
+
+        Returns:
+            List[Dict[str, float]]: List of probability dictionaries for each sample.
+        """
+        return [self.predict_proba_one(row, alpha=alpha) for row in features]
+
+    def prune(
+        self,
+        validation_features: List[List[Any]],
+        validation_labels: List[str]
+    ) -> None:
+        """
+        Performs reduced-error pruning using a validation set.
+        Recursively attempts to replace subtrees with leaf nodes if validation accuracy does not decrease.
+
+        Args:
+            validation_features (List[List[Any]]): Validation feature matrix.
+            validation_labels (List[str]): Validation class labels.
+        """
+        if not self.tree:
+            return
+
+        def accuracy(predictions, targets):
+            correct = sum(pred == target for pred, target in zip(predictions, targets))
+            return correct / len(targets) if targets else 0.0
+
+        def evaluate_tree(root: _Node) -> float:
+            predictions = [self._predict_with_root(root, sample) for sample in validation_features]
+            return accuracy(predictions, validation_labels)
+
+        def prune_node(node: _Node) -> None:
+            """
+            Recursively prunes the tree in post-order.
+            """
+            if node.is_leaf:
+                return
+            # Prune child nodes first
+            for _, child in list(node.children.items()):
+                prune_node(child)
+
+            # Attempt to prune current node by replacing with a leaf
+            current_score = evaluate_tree(self.tree)
+            original_state = (node.is_leaf, node.prediction, dict(node.children))
+            node.is_leaf = True
+            node.prediction = node.majority_class
+            node.children = {}
+
+            pruned_score = evaluate_tree(self.tree)
+
+            # If pruning decreases accuracy, revert to original state
+            if pruned_score + 1e-12 < current_score:
+                node.is_leaf, node.prediction, node.children = original_state
+
+        prune_node(self.tree)
+
+    def _predict_with_root(self, root: _Node, sample: List[Any]) -> str:
+        """
+        Predicts the class label for a sample using a specified tree root.
+
+        Args:
+            root (_Node): Root node of the tree.
+            sample (List[Any]): Feature values for the sample.
+
+        Returns:
+            str: Predicted class label.
+        """
+        node = root
+        while node and not node.is_leaf:
+            feature = node.feature
+            index = self.feature_index_map.get(feature, None)
+            if index is None:
+                return node.majority_class
+            value = self._normalize_value(sample[index])
+            if node.is_numeric:
+                if value is None:
+                    return node.majority_class
+                try:
+                    float_value = float(value)
+                except ValueError:
+                    return node.majority_class
+                branch = "LE" if float_value <= node.threshold else "GT"
+                next_node = node.children.get(branch, None)
+                if next_node is None:
+                    return node.majority_class
+                node = next_node
+            else:
+                key = value if value is not None else "__MISSING__"
+                next_node = node.children.get(key, None)
+                if next_node is None:
+                    return node.majority_class
+                node = next_node
+        return node.prediction if node else None
+
+    @staticmethod
+    def _majority(labels: List[str]) -> str:
+        """
+        Returns the majority class label from a list of labels.
+
+        Args:
+            labels (List[str]): List of class labels.
+
+        Returns:
+            str: Majority class label.
+        """
+        return DecisionTreeID3Plus._majority_from_counts(Counter(labels))
+
+    @staticmethod
+    def _majority_from_counts(counts: Counter) -> str:
+        """
+        Returns the majority class label from a Counter of class counts.
+        Breaks ties alphabetically for determinism.
+
+        Args:
+            counts (Counter): Counter of class label counts.
+
+        Returns:
+            str: Majority class label.
+        """
+        if not counts:
+            return None
+        max_count = max(counts.values())
+        candidates = sorted([label for label, count in counts.items() if count == max_count])
+        return candidates[0]
+
+    def _tree_lines(self, node: _Node, indent: str = "", is_last: bool = True) -> List[str]:
+        """
+        Generates a list of strings representing the tree structure for printing.
+
+        Args:
+            node (_Node): Current node.
+            indent (str): Indentation string.
+            is_last (bool): True if this is the last child.
+
+        Returns:
+            List[str]: Lines representing the tree.
         """
         lines: List[str] = []
         prefix = indent + ("└── " if is_last else "├── ")
-
-        if not isinstance(node, dict):
-            lines.append(prefix + f"Predict: {node}")
+        if node.is_leaf:
+            lines.append(prefix + f"Predict: {node.prediction}  [counts={dict(node.class_counts)}]")
             return lines
 
-        node_key = next(iter(node))
-        title = f"{node_key}? "
+        # Format split condition for numeric or categorical features
+        title = f"{node.feature}?"
+        if node.is_numeric:
+            title = f"{node.feature} <= {node.threshold:.6g} ?"
         lines.append(prefix + title)
-
-        # Determine children for numeric or categorical split
-        if " <=" in node_key:
-            children_items = [("True", node[node_key]["True"]), ("False", node[node_key]["False"])]
-        else:
-            children_items = sorted(node[node_key].items(), key=lambda item: str(item[0]))
-
         new_indent = indent + ("    " if is_last else "│   ")
-        for i, (branch_value, child) in enumerate(children_items):
-            last_child = (i == len(children_items) - 1)
+
+        if node.is_numeric:
+            # Numeric splits: "LE" and "GT" branches
+            order = [("LE", node.children.get("LE")), ("GT", node.children.get("GT"))]
+        else:
+            # Categorical splits: sort branches by value for consistency
+            order = sorted(node.children.items(), key=lambda kv: str(kv[0]))
+
+        for i, (branch, child) in enumerate(order):
+            last_child = (i == len(order) - 1)
             branch_label = new_indent + ("└── " if last_child else "├── ")
-            if not isinstance(child, dict):
-                lines.append(branch_label + f"{branch_value} → {child}")
+            if child.is_leaf:
+                lines.append(branch_label + f"{branch} → {child.prediction} [counts={dict(child.class_counts)}]")
             else:
-                lines.append(branch_label + f"{branch_value}")
+                lines.append(branch_label + f"{branch}")
                 lines.extend(self._tree_lines(child, new_indent + ("    " if last_child else "│   "), last_child))
         return lines
 
     def print_tree(self) -> str:
         """
-        Returns the decision tree structure as a readable string.
+        Returns a string representation of the decision tree structure.
+
+        Returns:
+            str: Tree structure as a string.
         """
         return "\n".join(self._tree_lines(self.tree))
