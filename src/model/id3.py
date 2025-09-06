@@ -1,12 +1,9 @@
 """
-@author Ulises Jaramillo Portilla | A01798380 | Ulises-JPx
+@author Ulises Jaramillo Portilla | A01798380
 
-This file implements the DecisionTreeID3Plus class, an advanced decision tree classifier based on the ID3 algorithm.
-It supports both categorical and numeric features, and allows for selection of splitting criteria ("info_gain" or "gain_ratio").
-The implementation includes configurable parameters such as minimum information gain, maximum tree depth, and minimum samples required to split a node.
-It robustly handles missing and unseen feature values by falling back to the majority class at each node.
-The classifier provides probability predictions using Laplace smoothing and supports reduced-error pruning using a validation set.
-The code is fully documented and organized for clarity and maintainability.
+ID3-based decision tree supporting categorical/numeric features, info gain/gain ratio, 
+missing values, probability prediction (Laplace smoothing), and reduced-error pruning.
+
 """
 
 import math
